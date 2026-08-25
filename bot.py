@@ -270,6 +270,30 @@ def parse_rental_date(value):
     return None
 
 
+def normalize_kz_phone(value):
+    """Return a Kazakhstan phone number in +7XXXXXXXXXX format, or None."""
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip()
+    for character in (" ", "(", ")", "-"):
+        normalized = normalized.replace(character, "")
+
+    if normalized.startswith("+"):
+        if len(normalized) == 12 and normalized[1] == "7" and normalized[2:].isdigit():
+            return normalized
+        return None
+
+    if not normalized.isdigit():
+        return None
+
+    if len(normalized) == 11 and normalized[0] in {"7", "8"}:
+        return "+7" + normalized[1:]
+    if len(normalized) == 10:
+        return "+7" + normalized
+    return None
+
+
 def format_rental_date(value):
     """Format a stored rental date for Telegram messages."""
     parsed_date = parse_rental_date(value)
@@ -1020,6 +1044,16 @@ async def handle_rental_answer(update: Update, user_id, user_text):
         await show_rental_calendar(update.message, rental_request, field)
         return
 
+    if field == "phone":
+        normalized_phone = normalize_kz_phone(value)
+        if normalized_phone is None:
+            await update.message.reply_text(
+                "Введите корректный номер телефона.\n"
+                "Например: +7 777 123 45 67"
+            )
+            return
+        value = normalized_phone
+
     rental_request["data"][field] = value
     if rental_step_index(rental_request) is None:
         await show_rental_summary(update, user_id)
@@ -1322,6 +1356,19 @@ async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_T
                 get_available_cities_from_cars(cars),
             )
         return
+
+    normalized_phone = normalize_kz_phone(rental_data.get("phone"))
+    if normalized_phone is None:
+        rental_data.pop("phone", None)
+        rental_request["is_saving"] = False
+        await update.message.reply_text(
+            "Введите корректный номер телефона.\n"
+            "Например: +7 777 123 45 67"
+        )
+        await ask_current_rental_step(update, user_id)
+        return
+
+    rental_data["phone"] = normalized_phone
 
     try:
         lead_number = await asyncio.to_thread(
