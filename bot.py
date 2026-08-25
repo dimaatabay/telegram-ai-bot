@@ -3,8 +3,9 @@ import logging
 import json
 import re
 import asyncio
+import calendar
 import tempfile
-from datetime import datetime
+from datetime import date, datetime
 
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
@@ -251,7 +252,13 @@ def rental_step_index(rental_request):
 async def ask_current_rental_step(update: Update, user_id):
     step_index = rental_step_index(rental_requests[user_id])
     if step_index is not None:
-        await update.message.reply_text(RENTAL_STEPS[step_index][1])
+        field, question = RENTAL_STEPS[step_index]
+        if field in {"start_date", "end_date"}:
+            await show_rental_calendar(
+                update.message, rental_requests[user_id], field
+            )
+        else:
+            await update.message.reply_text(question)
 
 
 def parse_rental_date(value):
@@ -261,6 +268,79 @@ def parse_rental_date(value):
         except ValueError:
             pass
     return None
+
+
+def format_rental_date(value):
+    """Format a stored rental date for Telegram messages."""
+    parsed_date = parse_rental_date(value)
+    return parsed_date.strftime("%d.%m.%Y") if parsed_date else value
+
+
+def calendar_minimum_date(rental_request, field):
+    """Return the earliest date that can be selected for one rental step."""
+    if field == "start_date":
+        return date.today()
+    return parse_rental_date(rental_request["data"].get("start_date", ""))
+
+
+def rental_calendar_keyboard(field, year, month, minimum_date):
+    """Build a month picker with disabled dates before minimum_date."""
+    first_weekday, days_in_month = calendar.monthrange(year, month)
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{calendar.month_name[month]} {year}", callback_data="cal:noop"
+        )],
+        [InlineKeyboardButton(day, callback_data="cal:noop") for day in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")],
+    ]
+    week = [InlineKeyboardButton(" ", callback_data="cal:noop") for _ in range(first_weekday)]
+    for day_number in range(1, days_in_month + 1):
+        selected_date = date(year, month, day_number)
+        callback_data = (
+            f"cal:pick:{field}:{selected_date.isoformat()}"
+            if selected_date >= minimum_date
+            else "cal:noop"
+        )
+        week.append(InlineKeyboardButton(str(day_number), callback_data=callback_data))
+        if len(week) == 7:
+            keyboard.append(week)
+            week = []
+    if week:
+        week.extend(InlineKeyboardButton(" ", callback_data="cal:noop") for _ in range(7 - len(week)))
+        keyboard.append(week)
+
+    previous_month = date(year - 1, 12, 1) if month == 1 else date(year, month - 1, 1)
+    next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    keyboard.append([
+        InlineKeyboardButton("‹", callback_data=f"cal:nav:{field}:{previous_month:%Y-%m}"),
+        InlineKeyboardButton("›", callback_data=f"cal:nav:{field}:{next_month:%Y-%m}"),
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def show_rental_calendar(message, rental_request, field, displayed_date=None):
+    """Show the calendar for a pending rental date step."""
+    minimum_date = calendar_minimum_date(rental_request, field)
+    if minimum_date is None:
+        await message.reply_text("Сначала выберите дату начала аренды.")
+        return
+
+    calendar_date = displayed_date or minimum_date
+    question = "Выберите дату начала аренды:" if field == "start_date" else "Выберите дату окончания аренды:"
+    await message.reply_text(
+        question,
+        reply_markup=rental_calendar_keyboard(
+            field, calendar_date.year, calendar_date.month, minimum_date
+        ),
+    )
+
+
+def clear_rental_car_and_following_data(rental_request):
+    """Keep the selected city while returning a draft to car selection."""
+    for field in (
+        "car_id", "car_make", "car_model", "daily_price", "car_type",
+        "start_date", "end_date", "name", "phone",
+    ):
+        rental_request["data"].pop(field, None)
 
 
 def get_sheets_service():
@@ -902,8 +982,8 @@ async def show_rental_summary(update: Update, user_id):
     await update.message.reply_text(
         "Ваша заявка:\n\n"
         f"Город: {data['city']}\n"
-        f"Дата начала: {data['start_date']}\n"
-        f"Дата окончания: {data['end_date']}\n"
+        f"Дата начала: {format_rental_date(data['start_date'])}\n"
+        f"Дата окончания: {format_rental_date(data['end_date'])}\n"
         f"Автомобиль: {data['car_type']}\n"
         f"Имя: {data['name']}\n"
         f"Телефон: {data['phone']}",
@@ -933,20 +1013,95 @@ async def handle_rental_answer(update: Update, user_id, user_text):
         await show_available_cities(update.message, rental_request)
         return
 
-    if field == "end_date":
-        start_date = parse_rental_date(rental_request["data"].get("start_date", ""))
-        end_date = parse_rental_date(value)
-        if start_date and end_date and end_date < start_date:
-            await update.message.reply_text(
-                "Дата окончания не может быть раньше даты начала. " + question
-            )
-            return
+    if field in {"start_date", "end_date"}:
+        await update.message.reply_text(
+            "Пожалуйста, выберите дату кнопкой в календаре ниже."
+        )
+        await show_rental_calendar(update.message, rental_request, field)
+        return
 
     rental_request["data"][field] = value
     if rental_step_index(rental_request) is None:
         await show_rental_summary(update, user_id)
     else:
         await ask_current_rental_step(update, user_id)
+
+
+async def handle_rental_calendar_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+
+    if query.data == "cal:noop":
+        await query.answer("Эта дата недоступна.", show_alert=True)
+        return
+
+    try:
+        _, action, field, value = query.data.split(":", 3)
+        if action not in {"nav", "pick"} or field not in {"start_date", "end_date"}:
+            raise ValueError("Invalid calendar callback")
+    except ValueError:
+        logger.warning("Invalid rental calendar callback")
+        await query.answer("Календарь устарел. Начните выбор даты заново.", show_alert=True)
+        return
+
+    user_id = update.effective_user.id
+    rental_request = rental_requests.get(user_id)
+    step_index = rental_step_index(rental_request) if rental_request else None
+    if (
+        rental_request is None
+        or step_index is None
+        or RENTAL_STEPS[step_index][0] != field
+    ):
+        await query.answer("Выбор этой даты больше не ожидается.", show_alert=True)
+        return
+
+    minimum_date = calendar_minimum_date(rental_request, field)
+    if minimum_date is None:
+        await query.answer("Сначала выберите дату начала аренды.", show_alert=True)
+        return
+
+    try:
+        if action == "nav":
+            displayed_date = datetime.strptime(value, "%Y-%m").date()
+            if (
+                value != displayed_date.strftime("%Y-%m")
+                or not 2000 <= displayed_date.year <= 2100
+            ):
+                raise ValueError("Invalid calendar month")
+            await query.answer()
+            await query.edit_message_reply_markup(
+                reply_markup=rental_calendar_keyboard(
+                    field,
+                    displayed_date.year,
+                    displayed_date.month,
+                    minimum_date,
+                )
+            )
+            return
+
+        selected_date = date.fromisoformat(value)
+        if value != selected_date.isoformat() or selected_date < minimum_date:
+            raise ValueError("Unavailable calendar date")
+    except ValueError:
+        logger.warning("Invalid or unavailable rental calendar callback: %s", query.data)
+        await query.answer("Эта дата недоступна. Выберите дату из календаря.", show_alert=True)
+        return
+
+    rental_request["data"][field] = selected_date.isoformat()
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    label = "Дата начала аренды" if field == "start_date" else "Дата окончания аренды"
+    await query.message.reply_text(f"{label}: {selected_date:%d.%m.%Y}")
+
+    if field == "start_date":
+        await show_rental_calendar(
+            query.message, rental_request, "end_date", selected_date
+        )
+    else:
+        await query.message.reply_text(RENTAL_STEPS[rental_step_index(rental_request)][1])
 
 
 async def handle_city_selection_callback(
@@ -1086,7 +1241,7 @@ async def handle_car_selection_callback(
     })
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(RENTAL_STEPS[rental_step_index(rental_request)][1])
+    await show_rental_calendar(query.message, rental_request, "start_date")
 
 
 async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1101,11 +1256,78 @@ async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     rental_request["is_saving"] = True
+    rental_data = rental_request["data"]
+    start_date = parse_rental_date(rental_data.get("start_date", ""))
+    end_date = parse_rental_date(rental_data.get("end_date", ""))
+    if (
+        start_date is None
+        or end_date is None
+        or start_date < date.today()
+        or end_date < start_date
+    ):
+        logger.warning("Invalid rental dates before save for user %s", user_id)
+        rental_data.pop("start_date", None)
+        rental_data.pop("end_date", None)
+        rental_request["is_saving"] = False
+        await update.message.reply_text(
+            "Пожалуйста, заново выберите даты аренды в календаре."
+        )
+        await show_rental_calendar(update.message, rental_request, "start_date")
+        return
+
+    try:
+        cars = await asyncio.to_thread(get_cars_from_sheet)
+    except Exception:
+        logger.exception("Failed to re-check car before saving rental for user %s", user_id)
+        rental_request["is_saving"] = False
+        await update.message.reply_text(
+            "Не удалось проверить доступность автомобиля. Попробуйте подтвердить "
+            "заявку немного позже.",
+            reply_markup=RENTAL_CONFIRMATION_KEYBOARD,
+        )
+        return
+
+    cars_with_selected_id = [
+        car for car in cars if car["id"] == rental_data.get("car_id")
+    ]
+    matching_cars = [
+        car for car in cars_with_selected_id
+        if is_available_car_in_city(car, rental_data.get("city", ""))
+    ]
+    if len(cars_with_selected_id) != 1 or len(matching_cars) != 1:
+        clear_rental_car_and_following_data(rental_request)
+        rental_request["is_saving"] = False
+        available_cars = [
+            car for car in cars
+            if is_available_car_in_city(car, rental_data.get("city", ""))
+        ]
+        await update.message.reply_text(
+            "К сожалению, выбранный автомобиль уже недоступен. "
+            "Пожалуйста, выберите другой автомобиль."
+        )
+        if available_cars:
+            await update.message.reply_text(
+                "Выберите доступный автомобиль:",
+                reply_markup=available_cars_keyboard(available_cars),
+            )
+        else:
+            rental_data.pop("city", None)
+            await update.message.reply_text(
+                "В выбранном городе больше нет свободных автомобилей. "
+                "Выберите другой город."
+            )
+            await show_available_cities(
+                update.message,
+                rental_request,
+                get_available_cities_from_cars(cars),
+            )
+        return
+
     try:
         lead_number = await asyncio.to_thread(
             append_rental_lead,
             user_id,
-            rental_request["data"],
+            rental_data,
         )
     except Exception:
         logger.exception("Failed to save rental request to Google Sheets for user %s", user_id)
@@ -1121,7 +1343,7 @@ async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_T
         context.bot,
         lead_number,
         user_id,
-        rental_request["data"],
+        rental_data,
     )
     rental_requests.pop(user_id, None)
     await update.message.reply_text("Заявка принята.", reply_markup=CHAT_KEYBOARD)
@@ -1407,6 +1629,7 @@ app.add_handler(CommandHandler("help", help_command))
 app.add_handler(CommandHandler("clear", clear_command))
 app.add_handler(CallbackQueryHandler(handle_manager_status_callback, pattern=r"^status:"))
 app.add_handler(CallbackQueryHandler(handle_client_cancellation_callback, pattern=r"^client_cancel:"))
+app.add_handler(CallbackQueryHandler(handle_rental_calendar_callback, pattern=r"^cal:"))
 app.add_handler(CallbackQueryHandler(handle_city_selection_callback, pattern=r"^city:"))
 app.add_handler(CallbackQueryHandler(handle_car_selection_callback, pattern=r"^car:"))
 app.add_handler(MessageHandler(filters.Regex("^" + re.escape(START_BUTTON_TEXT) + "$"), start_button))
