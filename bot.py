@@ -5,6 +5,7 @@ import re
 import asyncio
 import calendar
 import tempfile
+import uuid
 from datetime import date, datetime
 
 from dotenv import load_dotenv
@@ -538,12 +539,32 @@ def get_next_lead_number(values):
     return max(existing_numbers, default=0) + 1
 
 
+def find_rental_lead_by_booking_id(rows, booking_id):
+    """Return the existing lead number for a stable booking ID, if any."""
+    for row in rows:
+        if len(row) < 9 or str(row[8]).strip() != booking_id:
+            continue
+        try:
+            return int(str(row[0]).strip())
+        except (TypeError, ValueError):
+            raise ValueError("Existing booking ID has an invalid lead number")
+    return None
+
+
 def append_rental_lead(user_id, rental_data):
+    booking_id = rental_data.get("booking_id")
+    if not isinstance(booking_id, str) or not booking_id:
+        raise ValueError("Rental request is missing a booking ID")
+
     service = get_sheets_service()
     existing_rows = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range="A2:A",
+        range="A2:I",
     ).execute().get("values", [])
+    existing_lead_number = find_rental_lead_by_booking_id(existing_rows, booking_id)
+    if existing_lead_number is not None:
+        return existing_lead_number, True
+
     lead_number = get_next_lead_number(existing_rows)
     lead_row = [[
         lead_number,
@@ -554,15 +575,16 @@ def append_rental_lead(user_id, rental_data):
         rental_data["end_date"],
         rental_data["phone"],
         NEW_RENTAL_STATUS,
+        booking_id,
     ]]
 
     service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range="A:H",
+        range="A:I",
         valueInputOption="RAW",
         body={"values": lead_row},
     ).execute()
-    return lead_number
+    return lead_number, False
 
 
 def update_rental_lead_status(lead_number, status):
@@ -1291,6 +1313,8 @@ async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_T
 
     rental_request["is_saving"] = True
     rental_data = rental_request["data"]
+    if not rental_data.get("booking_id"):
+        rental_data["booking_id"] = uuid.uuid4().hex
     start_date = parse_rental_date(rental_data.get("start_date", ""))
     end_date = parse_rental_date(rental_data.get("end_date", ""))
     if (
@@ -1371,7 +1395,7 @@ async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_T
     rental_data["phone"] = normalized_phone
 
     try:
-        lead_number = await asyncio.to_thread(
+        lead_number, already_saved = await asyncio.to_thread(
             append_rental_lead,
             user_id,
             rental_data,
@@ -1383,6 +1407,18 @@ async def confirm_rental_request(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=RENTAL_CONFIRMATION_KEYBOARD,
         )
         rental_request["is_saving"] = False
+        return
+
+    if already_saved:
+        logger.info(
+            "Recovered already saved rental request %s for user %s",
+            lead_number,
+            user_id,
+        )
+        rental_requests.pop(user_id, None)
+        await update.message.reply_text(
+            "Эта заявка уже оформлена.", reply_markup=CHAT_KEYBOARD
+        )
         return
 
     logger.info("Saved confirmed rental request to Google Sheets for user %s", user_id)
