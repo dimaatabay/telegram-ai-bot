@@ -162,6 +162,13 @@ WELCOME_TEXT = (
     "\\u0414\\u043e\\u0431\\u0440\\u043e \\u043f\\u043e\\u0436\\u0430\\u043b\\u043e\\u0432\\u0430\\u0442\\u044c \\u0432 STIX \\U0001F44B\\n\\n"
     "\\u0412\\u044b\\u0431\\u0435\\u0440\\u0438\\u0442\\u0435 \\u043d\\u0443\\u0436\\u043d\\u043e\\u0435 \\u0434\\u0435\\u0439\\u0441\\u0442\\u0432\\u0438\\u0435 \\u043d\\u0438\\u0436\\u0435 \\u0438\\u043b\\u0438 \\u043f\\u0440\\u043e\\u0441\\u0442\\u043e \\u043d\\u0430\\u043f\\u0438\\u0448\\u0438\\u0442\\u0435 \\u0441\\u0432\\u043e\\u0439 \\u0432\\u043e\\u043f\\u0440\\u043e\\u0441."
 ).encode("ascii").decode("unicode_escape")
+HELP_TEXT = (
+    "STIX — помощник по аренде автомобилей.\n\n"
+    "Доступные команды:\n"
+    "/start — начать работу\n"
+    "/help — помощь\n\n"
+    "Вы также можете просто написать свой вопрос сообщением."
+)
 RENTAL_CONFIRMATION_KEYBOARD = ReplyKeyboardMarkup(
     [[CONFIRM_RENTAL_BUTTON_TEXT, CANCEL_RENTAL_BUTTON_TEXT]],
     resize_keyboard=True,
@@ -1116,6 +1123,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_welcome_message(update)
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+
 async def send_welcome_message(update: Update):
     if not os.path.isfile(STIX_WELCOME_FILE):
         logger.error("STIX welcome image file is missing: %s", STIX_WELCOME_FILE)
@@ -1305,6 +1316,7 @@ async def answer_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def set_bot_commands(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "\u041d\u0430\u0447\u0430\u0442\u044c \u0440\u0430\u0431\u043e\u0442\u0443"),
+        BotCommand("help", "\u041f\u043e\u043c\u043e\u0449\u044c"),
         BotCommand("clear", "\u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0438\u0441\u0442\u043e\u0440\u0438\u044e"),
     ])
 
@@ -1312,6 +1324,7 @@ async def set_bot_commands(application: Application):
 app = Application.builder().token(TELEGRAM_TOKEN).post_init(set_bot_commands).build()
 
 app.add_handler(CommandHandler("start", start_command))
+app.add_handler(CommandHandler("help", help_command))
 app.add_handler(CommandHandler("clear", clear_command))
 app.add_handler(CallbackQueryHandler(handle_manager_status_callback, pattern=r"^status:"))
 app.add_handler(CallbackQueryHandler(handle_client_cancellation_callback, pattern=r"^client_cancel:"))
