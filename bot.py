@@ -1321,8 +1321,38 @@ async def set_bot_commands(application: Application):
     ])
 
 
+async def handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log an unhandled update error and safely show a generic user message."""
+    error_type = type(context.error).__name__ if context.error else "UnknownError"
+    update_id = getattr(update, "update_id", None)
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+
+    logger.error(
+        "Unhandled Telegram update error: type=%s user_id=%s update_id=%s",
+        error_type,
+        user_id,
+        update_id,
+    )
+
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+
+    try:
+        await message.reply_text("Произошла временная ошибка. Попробуйте ещё раз.")
+    except Exception as send_error:
+        logger.error(
+            "Failed to send generic error response: type=%s user_id=%s update_id=%s",
+            type(send_error).__name__,
+            user_id,
+            update_id,
+        )
+
+
 app = Application.builder().token(TELEGRAM_TOKEN).post_init(set_bot_commands).build()
 
+app.add_error_handler(handle_application_error)
 app.add_handler(CommandHandler("start", start_command))
 app.add_handler(CommandHandler("help", help_command))
 app.add_handler(CommandHandler("clear", clear_command))
