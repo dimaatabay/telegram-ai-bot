@@ -9,7 +9,14 @@ from datetime import datetime
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -53,7 +60,14 @@ FINAL_RENTAL_STATUSES = {
     RENTAL_STATUS_BY_ACTION["cancelled"],
 }
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_TIMEOUT_SECONDS = 25
+OPENAI_MAX_ATTEMPTS = 2
+OPENAI_RETRY_DELAY_SECONDS = 1
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=OPENAI_TIMEOUT_SECONDS,
+    max_retries=0,
+)
 sheets_service = None
 MAX_HISTORY_MESSAGES = 10
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
@@ -1193,6 +1207,40 @@ def transcribe_voice_file(audio_path):
     return transcription_text.strip()
 
 
+async def run_openai_request(request):
+    """Run one synchronous SDK operation off the event loop with one retry."""
+    for attempt in range(OPENAI_MAX_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(request)
+        except (
+            APITimeoutError,
+            APIConnectionError,
+            RateLimitError,
+            InternalServerError,
+        ) as error:
+            if attempt == OPENAI_MAX_ATTEMPTS - 1:
+                raise
+
+            logger.warning(
+                "Retrying OpenAI request after %s (attempt %s of %s)",
+                type(error).__name__,
+                attempt + 1,
+                OPENAI_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(OPENAI_RETRY_DELAY_SECONDS)
+        except APIStatusError as error:
+            if error.status_code < 500 or attempt == OPENAI_MAX_ATTEMPTS - 1:
+                raise
+
+            logger.warning(
+                "Retrying OpenAI request after HTTP %s (attempt %s of %s)",
+                error.status_code,
+                attempt + 1,
+                OPENAI_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(OPENAI_RETRY_DELAY_SECONDS)
+
+
 async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text):
     user_id = update.effective_user.id
 
@@ -1230,17 +1278,19 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     save_user_histories()
 
     try:
-        response = client.responses.create(
-            model="gpt-5-mini",
-            input=[
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                *(
-                    [{"role": "system", "content": car_inventory_instructions}]
-                    if car_inventory_instructions
-                    else []
-                ),
-                *user_histories[user_id],
-            ],
+        response = await run_openai_request(
+            lambda: client.responses.create(
+                model="gpt-5-mini",
+                input=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    *(
+                        [{"role": "system", "content": car_inventory_instructions}]
+                        if car_inventory_instructions
+                        else []
+                    ),
+                    *user_histories[user_id],
+                ],
+            )
         )
         ai_answer = response.output_text
     except Exception:
@@ -1289,9 +1339,8 @@ async def answer_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         try:
-            user_text = await asyncio.to_thread(
-                transcribe_voice_file,
-                temporary_audio_path,
+            user_text = await run_openai_request(
+                lambda: transcribe_voice_file(temporary_audio_path)
             )
         except Exception:
             logger.exception("Failed to transcribe voice message for user %s", user_id)
